@@ -3,6 +3,8 @@ package dev.asdevs.signalr_flutter
 import android.os.Handler
 import android.os.Looper
 import androidx.annotation.NonNull
+import com.google.gson.JsonArray
+import com.google.gson.JsonElement
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import microsoft.aspnet.signalr.client.ConnectionState
@@ -13,7 +15,7 @@ import microsoft.aspnet.signalr.client.hubs.HubConnection
 import microsoft.aspnet.signalr.client.hubs.HubProxy
 import microsoft.aspnet.signalr.client.transport.LongPollingTransport
 import microsoft.aspnet.signalr.client.transport.ServerSentEventsTransport
-import java.lang.Exception
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** SignalrFlutterPlugin */
 class SignalrFlutterPlugin : FlutterPlugin, SignalrApi.SignalRHostApi {
@@ -22,13 +24,18 @@ class SignalrFlutterPlugin : FlutterPlugin, SignalrApi.SignalRHostApi {
 
     private lateinit var signalrApi: SignalrApi.SignalRPlatformApi
 
+    // Pigeon replies and Flutter API calls must happen on the platform (main) thread,
+    // while the SignalR SDK invokes its callbacks from background threads.
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
-        SignalrApi.SignalRHostApi.setup(flutterPluginBinding.binaryMessenger, this);
+        SignalrApi.SignalRHostApi.setup(flutterPluginBinding.binaryMessenger, this)
         signalrApi = SignalrApi.SignalRPlatformApi(flutterPluginBinding.binaryMessenger)
     }
 
     override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
-        SignalrApi.SignalRHostApi.setup(binding.binaryMessenger, null);
+        SignalrApi.SignalRHostApi.setup(binding.binaryMessenger, null)
+        stopConnection(detachCallbacks = true)
     }
 
     override fun connect(
@@ -36,9 +43,12 @@ class SignalrFlutterPlugin : FlutterPlugin, SignalrApi.SignalRHostApi {
         result: SignalrApi.Result<String>?
     ) {
         try {
-            connectionOptions ?: throw NullPointerException()
+            connectionOptions ?: throw NullPointerException("Connection options have null value")
 
-            connection =
+            // Drop any previous connection so its (late) callbacks can't clobber the new one's state.
+            stopConnection(detachCallbacks = true)
+
+            val conn =
                 if (connectionOptions.queryString != null && connectionOptions.queryString.isNotEmpty()) {
                     HubConnection(
                         connectionOptions.baseUrl,
@@ -54,86 +64,67 @@ class SignalrFlutterPlugin : FlutterPlugin, SignalrApi.SignalRHostApi {
                 val cred = Credentials { request ->
                     request.headers = connectionOptions.headers
                 }
-                connection.credentials = cred
+                conn.credentials = cred
             }
 
-            hub = connection.createHubProxy(connectionOptions.hubName)
+            val hubProxy = conn.createHubProxy(connectionOptions.hubName)
 
-            connectionOptions.hubMethods.forEach { methodName ->
-                hub.on(methodName, { res ->
-                    Handler(Looper.getMainLooper()).post {
-                        signalrApi.onNewMessage(methodName, res) { }
+            connectionOptions.hubMethods?.forEach { methodName ->
+                // Subscribe to the raw JsonElement arguments instead of the typed `on(..., String::class.java)`
+                // overload: the typed overload throws when the server sends a different number of
+                // arguments or a non-string payload.
+                hubProxy.subscribe(methodName).addReceivedHandler { args ->
+                    val message = argumentsToString(args)
+                    mainHandler.post {
+                        signalrApi.onNewMessage(methodName, message) { }
                     }
-                }, String::class.java)
-            }
-
-            connection.connected {
-                Handler(Looper.getMainLooper()).post {
-                    val statusChangeResult = SignalrApi.StatusChangeResult()
-                    statusChangeResult.connectionId = connection.connectionId
-                    statusChangeResult.status = SignalrApi.ConnectionStatus.connected
-                    signalrApi.onStatusChange(statusChangeResult) { }
                 }
             }
 
-            connection.reconnected {
-                Handler(Looper.getMainLooper()).post {
-                    val statusChangeResult = SignalrApi.StatusChangeResult()
-                    statusChangeResult.connectionId = connection.connectionId
-                    statusChangeResult.status = SignalrApi.ConnectionStatus.connected
-                    signalrApi.onStatusChange(statusChangeResult) { }
-                }
+            conn.connected {
+                postStatusChange(SignalrApi.ConnectionStatus.connected, conn.connectionId)
             }
 
-            connection.reconnecting {
-                Handler(Looper.getMainLooper()).post {
-                    val statusChangeResult = SignalrApi.StatusChangeResult()
-                    statusChangeResult.connectionId = connection.connectionId
-                    statusChangeResult.status = SignalrApi.ConnectionStatus.reconnecting
-                    signalrApi.onStatusChange(statusChangeResult) { }
-                }
+            conn.reconnected {
+                postStatusChange(SignalrApi.ConnectionStatus.connected, conn.connectionId)
             }
 
-            connection.closed {
-                Handler(Looper.getMainLooper()).post {
-                    val statusChangeResult = SignalrApi.StatusChangeResult()
-                    statusChangeResult.connectionId = connection.connectionId
-                    statusChangeResult.status = SignalrApi.ConnectionStatus.disconnected
-                    signalrApi.onStatusChange(statusChangeResult) { }
-                }
+            conn.reconnecting {
+                postStatusChange(SignalrApi.ConnectionStatus.reconnecting, conn.connectionId)
             }
 
-            connection.connectionSlow {
-                Handler(Looper.getMainLooper()).post {
-                    val statusChangeResult = SignalrApi.StatusChangeResult()
-                    statusChangeResult.connectionId = connection.connectionId
-                    statusChangeResult.status = SignalrApi.ConnectionStatus.connectionSlow
-                    signalrApi.onStatusChange(statusChangeResult) { }
-                }
+            conn.closed {
+                postStatusChange(SignalrApi.ConnectionStatus.disconnected, conn.connectionId)
             }
 
-            connection.error { handler ->
-                Handler(Looper.getMainLooper()).post {
-                    val statusChangeResult = SignalrApi.StatusChangeResult()
-                    statusChangeResult.status = SignalrApi.ConnectionStatus.connectionError
-                    statusChangeResult.errorMessage = handler.localizedMessage
-                    signalrApi.onStatusChange(statusChangeResult) { }
-                }
+            conn.connectionSlow {
+                postStatusChange(SignalrApi.ConnectionStatus.connectionSlow, conn.connectionId)
             }
 
-            when (connectionOptions.transport) {
-                SignalrApi.Transport.serverSentEvents -> connection.start(
+            conn.error { throwable ->
+                postStatusChange(
+                    SignalrApi.ConnectionStatus.connectionError,
+                    null,
+                    throwable.localizedMessage ?: throwable.toString()
+                )
+            }
+
+            connection = conn
+            hub = hubProxy
+
+            val startFuture = when (connectionOptions.transport) {
+                SignalrApi.Transport.serverSentEvents -> conn.start(
                     ServerSentEventsTransport(
-                        connection.logger
+                        conn.logger
                     )
                 )
-                SignalrApi.Transport.longPolling -> connection.start(LongPollingTransport(connection.logger))
+                SignalrApi.Transport.longPolling -> conn.start(LongPollingTransport(conn.logger))
                 else -> {
-                    connection.start()
+                    conn.start()
                 }
             }
 
-            result?.success(connection.connectionId ?: "")
+            replyWhenStarted(conn, startFuture, result)
         } catch (ex: Exception) {
             result?.error(ex)
         }
@@ -141,8 +132,10 @@ class SignalrFlutterPlugin : FlutterPlugin, SignalrApi.SignalRHostApi {
 
     override fun reconnect(result: SignalrApi.Result<String>?) {
         try {
-            connection.start()
-            result?.success(connection.connectionId ?: "")
+            if (!this::connection.isInitialized) {
+                throw IllegalStateException("SignalR Connection not found or null. Start SignalR connection first.")
+            }
+            replyWhenStarted(connection, connection.start(), result)
         } catch (ex: Exception) {
             result?.error(ex)
         }
@@ -150,7 +143,8 @@ class SignalrFlutterPlugin : FlutterPlugin, SignalrApi.SignalRHostApi {
 
     override fun stop(result: SignalrApi.Result<Void>?) {
         try {
-            connection.stop()
+            stopConnection()
+            result?.success(null)
         } catch (ex: Exception) {
             result?.error(ex)
         }
@@ -177,21 +171,101 @@ class SignalrFlutterPlugin : FlutterPlugin, SignalrApi.SignalRHostApi {
         result: SignalrApi.Result<String>?
     ) {
         try {
-            arguments ?: throw NullPointerException()
-            val res: SignalRFuture<String> =
-                hub.invoke(String::class.java, methodName, *arguments.toTypedArray())
+            arguments ?: throw NullPointerException("Arguments have null value")
+            if (!this::hub.isInitialized) {
+                throw IllegalStateException("Hub is null. Initiate a connection first.")
+            }
 
-            res.done { msg: String? ->
-                Handler(Looper.getMainLooper()).post {
-                    result?.success(msg ?: "")
+            // Ask for the raw JsonElement so non-string return values (objects, numbers, arrays)
+            // are forwarded as JSON instead of failing gson deserialization.
+            val res: SignalRFuture<JsonElement> =
+                hub.invoke(JsonElement::class.java, methodName, *arguments.toTypedArray())
+
+            val replied = AtomicBoolean(false)
+
+            res.done { msg: JsonElement? ->
+                if (replied.compareAndSet(false, true)) {
+                    val message = jsonToString(msg)
+                    mainHandler.post { result?.success(message) }
                 }
             }
 
             res.onError { throwable ->
-                throw throwable
+                if (replied.compareAndSet(false, true)) {
+                    mainHandler.post { result?.error(throwable) }
+                }
             }
         } catch (ex: Exception) {
             result?.error(ex)
         }
+    }
+
+    //---- Helpers ----//
+
+    /** Completes [result] with the connection id once [startFuture] finishes (or fails). */
+    private fun replyWhenStarted(
+        conn: HubConnection,
+        startFuture: SignalRFuture<Void>,
+        result: SignalrApi.Result<String>?
+    ) {
+        val replied = AtomicBoolean(false)
+
+        startFuture.done {
+            if (replied.compareAndSet(false, true)) {
+                val connectionId = conn.connectionId ?: ""
+                mainHandler.post { result?.success(connectionId) }
+            }
+        }
+
+        startFuture.onError { throwable ->
+            if (replied.compareAndSet(false, true)) {
+                mainHandler.post { result?.error(throwable) }
+            }
+        }
+    }
+
+    private fun stopConnection(detachCallbacks: Boolean = false) {
+        if (!this::connection.isInitialized) return
+
+        val conn = connection
+        if (detachCallbacks) {
+            conn.connected(null)
+            conn.reconnected(null)
+            conn.reconnecting(null)
+            conn.connectionSlow(null)
+            conn.error(null)
+            conn.closed(null)
+        }
+        conn.stop()
+    }
+
+    private fun postStatusChange(
+        status: SignalrApi.ConnectionStatus,
+        connectionId: String?,
+        errorMessage: String? = null
+    ) {
+        if (!this::signalrApi.isInitialized) return
+
+        mainHandler.post {
+            val statusChangeResult = SignalrApi.StatusChangeResult()
+            statusChangeResult.connectionId = connectionId
+            statusChangeResult.status = status
+            statusChangeResult.errorMessage = errorMessage
+            signalrApi.onStatusChange(statusChangeResult) { }
+        }
+    }
+
+    /** A plain string is forwarded as-is; anything else is forwarded as JSON. */
+    private fun jsonToString(element: JsonElement?): String = when {
+        element == null || element.isJsonNull -> ""
+        element.isJsonPrimitive && element.asJsonPrimitive.isString -> element.asString
+        else -> element.toString()
+    }
+
+    /** Single argument -> the argument itself, multiple arguments -> a JSON array of them. */
+    private fun argumentsToString(args: Array<JsonElement>?): String = when {
+        args == null || args.isEmpty() -> ""
+        args.size == 1 -> jsonToString(args[0])
+        else -> JsonArray().apply { args.forEach { add(it) } }.toString()
     }
 }

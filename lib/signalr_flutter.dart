@@ -1,12 +1,13 @@
 import 'dart:async';
 
-import 'package:flutter/services.dart';
 import 'package:signalr_flutter/signalr_api.dart';
 import 'package:signalr_flutter/signalr_platform_interface.dart';
 
+export 'package:signalr_flutter/signalr_api.dart' show Transport, ConnectionStatus;
+
 class SignalR extends SignalrPlatformInterface implements SignalRPlatformApi {
   // Private variables
-  static late final SignalRHostApi _signalrApi = SignalRHostApi();
+  static final SignalRHostApi _signalrApi = SignalRHostApi();
 
   // Constructor
   SignalR(
@@ -22,6 +23,7 @@ class SignalR extends SignalrPlatformInterface implements SignalRPlatformApi {
             queryString: queryString,
             headers: headers,
             hubMethods: hubMethods,
+            transport: transport,
             statusChangeCallback: statusChangeCallback,
             hubCallback: hubCallback);
 
@@ -29,22 +31,24 @@ class SignalR extends SignalrPlatformInterface implements SignalRPlatformApi {
   // ------------------------//
   @override
   Future<void> onNewMessage(String hubName, String message) async {
-    if (hubCallback != null) {
-      hubCallback!(hubName, message);
-    }
+    hubCallback?.call(hubName, message);
   }
 
   @override
   Future<void> onStatusChange(StatusChangeResult statusChangeResult) async {
-    connectionId = statusChangeResult.connectionId;
-
-    if (statusChangeCallback != null) {
-      statusChangeCallback!(statusChangeResult.status);
+    // Transient errors (e.g. while reconnecting) don't carry a connection id,
+    // so only overwrite the one we have when the platform actually sends one.
+    if (statusChangeResult.connectionId != null) {
+      connectionId = statusChangeResult.connectionId;
+    } else if (statusChangeResult.status == ConnectionStatus.disconnected) {
+      connectionId = null;
     }
 
     if (statusChangeResult.errorMessage != null) {
-      throw PlatformException(code: 'channel-error', message: statusChangeResult.errorMessage);
+      lastErrorMessage = statusChangeResult.errorMessage;
     }
+
+    statusChangeCallback?.call(statusChangeResult.status);
   }
 
   //---- Public Methods ----//
@@ -57,25 +61,21 @@ class SignalR extends SignalrPlatformInterface implements SignalRPlatformApi {
   /// Returns the [connectionId].
   @override
   Future<String?> connect() async {
-    try {
-      // Construct ConnectionOptions
-      ConnectionOptions options = ConnectionOptions();
-      options.baseUrl = baseUrl;
-      options.hubName = hubName;
-      options.queryString = queryString;
-      options.hubMethods = hubMethods;
-      options.headers = headers;
-      options.transport = transport;
+    // Construct ConnectionOptions
+    ConnectionOptions options = ConnectionOptions();
+    options.baseUrl = baseUrl;
+    options.hubName = hubName;
+    options.queryString = queryString;
+    options.hubMethods = hubMethods;
+    options.headers = headers;
+    options.transport = transport;
 
-      // Register SignalR Callbacks
-      SignalRPlatformApi.setup(this);
+    // Register SignalR Callbacks
+    SignalRPlatformApi.setup(this);
 
-      connectionId = await _signalrApi.connect(options);
+    connectionId = await _signalrApi.connect(options);
 
-      return connectionId;
-    } catch (e) {
-      return Future.error(e);
-    }
+    return connectionId;
   }
 
   /// Try to Reconnect SignalR connection if it gets disconnected.
@@ -83,43 +83,22 @@ class SignalR extends SignalrPlatformInterface implements SignalRPlatformApi {
   /// Returns the [connectionId]
   @override
   Future<String?> reconnect() async {
-    try {
-      connectionId = await _signalrApi.reconnect();
-      return connectionId;
-    } catch (e) {
-      return Future.error(e);
-    }
+    connectionId = await _signalrApi.reconnect();
+    return connectionId;
   }
 
   /// Stops SignalR connection
   @override
-  void stop() async {
-    try {
-      await _signalrApi.stop();
-    } catch (e) {
-      return Future.error(e);
-    }
-  }
+  Future<void> stop() => _signalrApi.stop();
 
   /// Checks if SignalR connection is still active.
   ///
   /// Returns a boolean value
   @override
-  Future<bool> isConnected() async {
-    try {
-      return await _signalrApi.isConnected();
-    } catch (e) {
-      return Future.error(e);
-    }
-  }
+  Future<bool> isConnected() => _signalrApi.isConnected();
 
   /// Invoke any server method with optional [arguments].
   @override
-  Future<String> invokeMethod(String methodName, {List<String>? arguments}) async {
-    try {
-      return await _signalrApi.invokeMethod(methodName, arguments ?? List.empty());
-    } catch (e) {
-      return Future.error(e);
-    }
-  }
+  Future<String> invokeMethod(String methodName, {List<String>? arguments}) =>
+      _signalrApi.invokeMethod(methodName, arguments ?? const <String>[]);
 }

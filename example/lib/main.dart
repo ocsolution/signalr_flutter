@@ -1,10 +1,8 @@
 // ignore_for_file: avoid_print
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'dart:async';
 
-import 'package:signalr_flutter/signalr_api.dart';
 import 'package:signalr_flutter/signalr_flutter.dart';
 
 void main() {
@@ -51,7 +49,7 @@ class _MyAppState extends State<MyApp> {
             mainAxisAlignment: MainAxisAlignment.center,
             children: <Widget>[
               Text("Connection Status: $signalRStatus\n",
-                  style: Theme.of(context).textTheme.headline6),
+                  style: Theme.of(context).textTheme.titleLarge),
               Padding(
                 padding: const EdgeInsets.only(top: 20.0),
                 child: ElevatedButton(onPressed: _buttonTapped, child: const Text("Invoke Method")),
@@ -62,12 +60,16 @@ class _MyAppState extends State<MyApp> {
         floatingActionButton: FloatingActionButton(
           child: const Icon(Icons.cast_connected),
           onPressed: () async {
-            final isConnected = await signalR.isConnected();
-            if (!isConnected) {
-              final connId = await signalR.connect();
-              print("Connection ID: $connId");
-            } else {
-              signalR.stop();
+            try {
+              final isConnected = await signalR.isConnected();
+              if (!isConnected) {
+                final connId = await signalR.connect();
+                print("Connection ID: $connId");
+              } else {
+                await signalR.stop();
+              }
+            } catch (e) {
+              print("SignalR error: $e (${signalR.lastErrorMessage})");
             }
           },
         ),
@@ -78,7 +80,7 @@ class _MyAppState extends State<MyApp> {
   void _onStatusChange(ConnectionStatus? status) {
     if (mounted) {
       setState(() {
-        signalRStatus = describeEnum(status ?? ConnectionStatus.disconnected);
+        signalRStatus = (status ?? ConnectionStatus.disconnected).name;
       });
     }
   }

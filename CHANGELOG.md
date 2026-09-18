@@ -77,3 +77,17 @@
 ## 0.2.0-dev.4
 
 * App bundle build issue fix.
+
+## 0.2.0-dev.5
+
+* `transport` passed to the `SignalR` constructor is now actually used (it was silently ignored before).
+* `stop()` now returns a `Future<void>` that completes; previously the native side never replied, so awaiting it hung forever.
+* `connect()`/`reconnect()` now resolve once the connection is actually established and return the real `connectionId` (they used to return an empty string immediately). Connection failures reject the future.
+* Connection errors no longer throw an unhandled `PlatformException` out of the status callback; the message is available on `lastErrorMessage` alongside `ConnectionStatus.connectionError`.
+* Android: `invokeMethod` failures are reported to the caller instead of throwing on a background thread.
+* Android & iOS: hub messages and `invokeMethod` results that are not plain strings (objects, arrays, numbers, multiple arguments) are delivered as JSON instead of crashing / being dropped.
+* iOS: `queryString` with several parameters (`a=1&b=2`) or without `=` no longer crashes; it is passed through verbatim like on Android.
+* iOS: calling `connect()` again tears down the previous connection (and its `WKWebView`) instead of leaking it.
+* Android: R8 keep rules for the SignalR client are now shipped with the plugin (`consumer-rules.pro`), so no manual proguard entry is needed.
+* Example app updated to current Flutter / Android Gradle tooling.
+

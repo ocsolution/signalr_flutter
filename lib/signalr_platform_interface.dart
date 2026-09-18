@@ -15,11 +15,17 @@ abstract class SignalrPlatformInterface {
   final String hubName;
   final String? queryString;
 
-  /// [Transport.Auto] is default.
+  /// [Transport.auto] is default.
   final Transport transport;
   final Map<String, String>? headers;
 
   String? connectionId;
+
+  /// The last error message reported by the native SignalR client, if any.
+  ///
+  /// It is updated right before [statusChangeCallback] is invoked with
+  /// [ConnectionStatus.connectionError].
+  String? lastErrorMessage;
 
   /// List of Hub method names you want to subscribe. Every subsequent message from server gets called on [hubCallback].
   final List<String>? hubMethods;
@@ -43,7 +49,7 @@ abstract class SignalrPlatformInterface {
   Future<String?> reconnect();
 
   /// Stops SignalR connection
-  void stop();
+  Future<void> stop();
 
   /// Checks if SignalR connection is still active.
   ///

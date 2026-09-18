@@ -120,9 +120,15 @@ open class SignalR: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
 
   open var customUserAgent: String?
 
+  /// Either a dictionary (serialized by jQuery via `$.param`) or a raw query string
+  /// such as `"a=1&b=2"`, which is appended to the URL as-is.
   open var queryString: Any? {
     didSet {
-      if let qs: Any = queryString {
+      if let qs = queryString as? String {
+        if let json = SignalR.stringify(qs) {
+          runJavaScript("swiftR.connection.qs = \(json)")
+        }
+      } else if let qs: Any = queryString, JSONSerialization.isValidJSONObject(qs) {
         if let jsonData = try? JSONSerialization.data(withJSONObject: qs, options: JSONSerialization.WritingOptions()) {
           let json = NSString(data: jsonData, encoding: String.Encoding.utf8.rawValue)! as String
           runJavaScript("swiftR.connection.qs = \(json)")
@@ -188,7 +194,7 @@ open class SignalR: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
       if #available(iOS 9.0, *) {
         let temp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("SwiftR", isDirectory: true)
         let jqueryTempURL = temp.appendingPathComponent("jquery-2.1.3.min.js")
-        let signalRTempURL = temp.appendingPathComponent("jquery.signalr-\(signalRVersion).min")
+        let signalRTempURL = temp.appendingPathComponent("jquery.signalr-\(signalRVersion).min.js")
         let jsTempURL = temp.appendingPathComponent("SwiftR.js")
 
         let fileManager = FileManager.default
@@ -284,6 +290,35 @@ open class SignalR: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
 
   open func stop() {
     runJavaScript("swiftR.connection.stop()")
+  }
+
+  /// Stops the connection and releases the backing web view.
+  ///
+  /// The web view's script message handler holds a strong reference to this object, so a
+  /// connection that is simply dropped would leak (together with its WKWebView) forever.
+  open func tearDown() {
+    starting = nil
+    connected = nil
+    disconnected = nil
+    connectionSlow = nil
+    connectionFailed = nil
+    reconnecting = nil
+    reconnected = nil
+    error = nil
+    received = nil
+    hubs.removeAll()
+    jsQueue.removeAll()
+    SwiftR.connections.removeAll { $0 === self }
+
+    guard let webView = wkWebView else { return }
+    wkWebView = nil
+    webView.configuration.userContentController.removeScriptMessageHandler(forName: "interOp")
+    webView.navigationDelegate = nil
+
+    // Let the JS client send its abort request before the web view goes away.
+    webView.evaluateJavaScript("if (swiftR.connection) { swiftR.connection.stop(); }") { _, _ in
+      webView.removeFromSuperview()
+    }
   }
 
   func processMessage(_ json: [String: Any]) {
@@ -395,6 +430,7 @@ open class SignalR: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
   // http://stackoverflow.com/questions/26514090/wkwebview-does-not-run-javascriptxml-http-request-with-out-adding-a-parent-vie#answer-26575892
   open func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
     #if os(iOS)
+    guard let wkWebView = wkWebView else { return }
     UIApplication.shared.keyWindow?.addSubview(wkWebView)
     #endif
   }
@@ -402,8 +438,9 @@ open class SignalR: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
   // MARK: - WKScriptMessageHandler
 
   open func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+    guard let webView = wkWebView else { return }
     if let id = message.body as? String {
-      wkWebView.evaluateJavaScript("readMessage('\(id)')", completionHandler: { [weak self] (msg, err) in
+      webView.evaluateJavaScript("readMessage('\(id)')", completionHandler: { [weak self] (msg, err) in
         if let m = msg as? [String: Any] {
           self?.processMessage(m)
         } else if let e = err {
